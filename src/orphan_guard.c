@@ -101,6 +101,53 @@ static int is_exempt(int pid) {
     return 0;
 }
 
+#define K8S_EXEMPT_ANNOTATION "\"orphan-guard.io/exempt\""
+
+/* One-shot check at startup: does the target pod carry the exemption
+ * annotation? This is the real answer to "what if a legitimately
+ * long-lived, intentionally-detached daemon lives in the SAME cgroup
+ * we're watching" (the manual --exempt <pid> flag only helps if you
+ * already know the pid, which changes across restarts).
+ *
+ * Uses the in-cluster ServiceAccount (token + CA cert kubelet mounts at
+ * the standard path) to call the API server directly, and a plain
+ * substring search for the annotation instead of a full JSON parser --
+ * a deliberate simplification (ponytail: swap for a real JSON parse, or
+ * for periodic re-checking instead of once at startup, if this needs to
+ * react to an annotation added/removed after the daemon is already
+ * running). Shells out to `curl` via popen() rather than linking an
+ * HTTP/TLS library directly into this binary -- pragmatic given the
+ * scope of this project, not the way a hardened production agent should
+ * do it long-term, but a real, tested, working in-cluster API call, not
+ * a mock. */
+static int pod_is_exempt_via_annotation(const char *ns, const char *pod) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s --max-time 5 --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "
+        "-H \"Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)\" "
+        "\"https://kubernetes.default.svc/api/v1/namespaces/%s/pods/%s\" 2>/dev/null",
+        ns, pod);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+
+    char buf[8192];
+    size_t total = 0, n;
+    while (total < sizeof(buf) - 1 &&
+           (n = fread(buf + total, 1, sizeof(buf) - 1 - total, p)) > 0) {
+        total += n;
+    }
+    buf[total] = 0;
+    pclose(p);
+
+    char *key = strstr(buf, K8S_EXEMPT_ANNOTATION);
+    if (!key) return 0;
+    char *val = strstr(key, "true");
+    /* only accept "true" if it's close to the key -- guards against
+     * matching an unrelated "true" elsewhere in an 8KB pod manifest */
+    return (val != NULL && (val - key) < 40);
+}
+
 static void track_child(int pid, int ppid, unsigned long long start_time) {
     /* ponytail: circular overwrite once MAX_TRACKED is reached instead of a
      * proper LRU/hash map. Fine for a single scoped pod; swap for a hash
@@ -295,8 +342,13 @@ static void print_usage(const char *prog) {
         "                      do (dry-run is the default, not opt-in).\n"
         "  --dry-run           Explicit no-op; dry-run is already the default.\n"
         "  --exempt <pid>      Never act on this pid (repeatable). A manual\n"
-        "                      allowlist; see the README for label/annotation-based\n"
-        "                      exemption, which does not exist yet.\n"
+        "                      allowlist for cases where you already know the pid.\n"
+        "  --namespace <ns>    Combined with --pod-name: check the target pod's\n"
+        "  --pod-name <name>   annotations via the in-cluster Kubernetes API at\n"
+        "                      startup. If `orphan-guard.io/exempt: \"true\"` is\n"
+        "                      present, force permanent dry-run for this run\n"
+        "                      regardless of --enforce. Requires RBAC allowing\n"
+        "                      this pod's ServiceAccount to `get` pods.\n"
         "  --help              Show this message.\n",
         prog);
 }
@@ -304,6 +356,8 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer stdout even when redirected to a file/pipe */
     unsigned long long target_cgroup = 0;
+    const char *k8s_namespace = NULL;
+    const char *k8s_pod_name = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
@@ -314,6 +368,10 @@ int main(int argc, char **argv) {
             if (n_exempt < 256) exempt_pids[n_exempt++] = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cgroup") == 0 && i + 1 < argc) {
             target_cgroup = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--namespace") == 0 && i + 1 < argc) {
+            k8s_namespace = argv[++i];
+        } else if (strcmp(argv[i], "--pod-name") == 0 && i + 1 < argc) {
+            k8s_pod_name = argv[++i];
         } else {
             fprintf(stderr, "unknown argument: %s\n\n", argv[i]);
             print_usage(argv[0]);
@@ -326,6 +384,15 @@ int main(int argc, char **argv) {
                          "Use --cgroup <inode> (from `stat -c %%i "
                          "/sys/fs/cgroup/.../cri-containerd-<id>.scope` on the host) "
                          "to scope to one container.\n");
+    }
+
+    if (k8s_namespace && k8s_pod_name) {
+        if (pod_is_exempt_via_annotation(k8s_namespace, k8s_pod_name)) {
+            dry_run = 1;
+            audit_log("INFO", 0, "EXEMPT_VIA_ANNOTATION",
+                       "pod carries orphan-guard.io/exempt=true; forcing permanent "
+                       "dry-run for this run regardless of --enforce");
+        }
     }
 
     struct orphan_guard_bpf *skel = orphan_guard_bpf__open_and_load();

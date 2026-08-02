@@ -92,9 +92,17 @@ version — full argument in [`docs/cfp/why-ebpf-not-container-runtime.md`](docs
   line: `<ISO8601> level=<INFO|ALERT|ACTION> pid=<n> action=<TAG>
   dry_run=<bool> detail="..."`. `SIGTERM_SENT` vs `SIGTERM_WOULD_SEND`
   (etc.) make it unambiguous whether an action actually happened.
-- **`--exempt <pid>`**: manual allowlist. A real annotation/label-based
-  allowlist for intentionally long-lived orphans does not exist yet (see
-  Known limitations).
+- **`--exempt <pid>`**: manual allowlist for when you already know the pid.
+- **`--namespace <ns> --pod-name <name>`**: at startup, checks the target
+  pod's annotations via the in-cluster Kubernetes API (needs RBAC to `get`
+  pods — see `build/orphan-guard-rbac.yaml`). If
+  `orphan-guard.io/exempt: "true"` is present, forces permanent dry-run
+  for that run regardless of `--enforce` — the real answer to "what if a
+  legitimately long-lived, intentionally-detached daemon lives in the
+  same cgroup we're watching." Verified against `legit-daemon-pod`:
+  annotated -> forced dry-run even with `--enforce`; unannotated
+  (`zombie-pod`) -> `--enforce` behaves normally. One-shot check at
+  startup, not continuously re-polled — see Known limitations.
 
 ## Building
 
@@ -175,8 +183,13 @@ restrictive Pod Security Admission) — in
 - **Kernel-level observation alone can't infer intent.** A legitimately
   long-lived, intentionally-detached daemon and a leaked worker look
   identical from `sched_process_fork`/`exit` + `/dev/shm` references
-  alone. Today's only mitigation is the manual `--exempt <pid>` allowlist;
-  a real annotation/label-based policy is future work.
+  alone. Mitigated via `--exempt <pid>` (manual) and annotation-based
+  exemption (`--namespace`/`--pod-name`, checked once at startup via the
+  in-cluster API) — but the annotation check is one-shot at startup, not
+  a continuous watch, so annotating a pod *after* the agent has already
+  started for it has no effect until the agent restarts. A real
+  production version would want a periodic re-check or a K8s watch
+  instead of a one-time API call.
 - **Children are tracked in a fixed-size circular buffer**, not a proper
   hash map — fine for a single scoped pod, would need revisiting for an
   unscoped, node-wide deployment.
