@@ -1,0 +1,112 @@
+==============================================================================
+Troubleshooting Story: Two False Failures While Proving It Actually Works
+==============================================================================
+Task #10 - repeatability trials + adversarial false-positive control
+Date: 2026-08-02
+
+------------------------------------------------------------------------------
+SETUP
+------------------------------------------------------------------------------
+Earlier false-positive tests (Redis, legit-daemon-pod) ran in SEPARATE pods
+from the leak target -- a weak test, since our detector is cgroup-scoped
+and would never even look at a different pod's processes regardless of
+what they do. The real test needs the adversarial workloads sharing the
+SAME cgroup as the leak target, so the detector actually has the
+opportunity to make a wrong call.
+
+Rebuilt the test: zombie-pod now also runs a real `redis-server` and a
+real Celery worker pool (concurrency=4, `celery -A celery_app worker`)
+in the background, all in the same container/cgroup as the
+zombie_maker.py leak scenario. Ran 15 repeated leak-and-recover cycles
+while Redis and Celery kept running continuously.
+
+------------------------------------------------------------------------------
+FALSE FAILURE #1: 0/15, but the daemon log showed [Skip] on every trial
+------------------------------------------------------------------------------
+First run: 15/15 reported as "leak not reclaimed." Not a false positive
+(Redis/Celery were never touched) -- the leak just never got cleaned up
+at all. The daemon log explained it:
+
+    [Skip] PID 1394074 is only 0s old, likely process-launch handoff noise...
+
+The trial script polled for the worker to appear and killed the parent
+almost immediately after -- inside the MIN_CHILD_AGE_SEC=2 window we added
+in Task #9 specifically to stop the detector from reacting to
+just-launched, healthy processes. The test was, by construction, moving
+faster than any real workload we'd modeled that guard on. Fixed by adding
+a realistic `sleep 3` between "worker exists" and "kill the parent" --
+matching how every real scenario we've reproduced actually behaves (a
+worker runs normally for several seconds before anything crashes).
+
+This is a real, worth-stating tradeoff, not just a test artifact: our
+false-positive fix (Task #9) trades a small amount of detection latency
+for launch-noise immunity. A crash that happens to occur within 2 seconds
+of a worker's own birth will currently be missed. We accepted this
+because every real leak we found (zombie_maker.py, PyTorch DataLoader,
+Ray) involved workers that had been running normally for seconds first --
+but it is a genuine, documented limitation, not a free lunch.
+
+------------------------------------------------------------------------------
+FALSE FAILURE #2: still 0/15 after fixing the timing -- this time our own bug
+------------------------------------------------------------------------------
+Re-ran with the timing fix. Still 0/15. This time the daemon log showed
+the detector actually working (`[Watch]` -> no further action needed
+because... nothing showed as failing, which was itself suspicious).
+
+Manually replayed a single trial with per-second observation:
+
+    +1s: worker PID 20189 state=S (sleeping, alive)     shm=101M
+    +2s: worker PID 20189 state=Z (zombie/<defunct>)    shm=16K
+
+The detector had already caught and reclaimed the leak by t+2s exactly as
+designed. The trial script's own success check was wrong:
+
+    WORKER_ALIVE=$(kill -0 $WORKER 2>/dev/null && echo yes || echo no)
+
+`kill -0 <pid>` only tests whether the pid still exists in the process
+table -- and a zombie (a process that has exited but was never reaped,
+which is exactly what a `sleep infinity` PID 1 leaves behind) still has a
+process-table entry. `kill -0` on a zombie returns success. The script was
+reporting "still alive" for a process that had been correctly killed and
+had already released 100MB back to the kernel, purely because nobody had
+called `wait()` on its corpse.
+
+Fixed by checking the actual ground truth -- `/dev/shm` usage -- instead
+of process liveness:
+
+    SHM_USED_KB=$(df /dev/shm | tail -1 | awk '{print $3}')
+    if [ "$SHM_USED_KB" -gt 2048 ]; then RESULT="LEAK_NOT_RECLAIMED"; ...
+
+------------------------------------------------------------------------------
+FINAL RESULT (after both fixes)
+------------------------------------------------------------------------------
+    TRIAL 1  through TRIAL 15: shm_used_kb=16 redis=PONG result=OK
+    === SUMMARY: 15/15 leaks reclaimed, 0 failures, 0 false-positive incidents ===
+
+Then a functional (not just "pid unchanged") check on Celery after all 15
+cycles:
+
+    >>> ping.delay().get(timeout=10)
+    'pong'
+
+Celery's worker pool actually round-tripped a real task through Redis
+after 15 consecutive kill-and-remediate cycles running in the same
+cgroup, not just "the pids look the same."
+
+------------------------------------------------------------------------------
+LESSON LEARNED (for the talk / paper)
+------------------------------------------------------------------------------
+- Both failures here were in the TEST, not the detector -- but "0/15,
+  looks broken" and "0/15, actually working" produce identical-looking
+  output unless you dig in. Don't trust a failing test result at face
+  value any more than a passing one; both need the same scrutiny.
+- `kill -0` is not "is this process doing anything," it's "does this pid
+  still exist" -- a distinction that matters enormously for any tool
+  whose entire job is reasoning about process lifecycle. Use the resource
+  you actually care about (here, tmpfs usage) as ground truth, not a proxy
+  that conflates "zombie" with "alive."
+- The adversarial control needs to share fate with the target, not just
+  exist somewhere in the cluster. Redis/Celery in a different pod would
+  have "passed" trivially and told us nothing; putting them in the same
+  cgroup as the thing getting killed is what makes the 0-false-positive
+  result actually mean something.

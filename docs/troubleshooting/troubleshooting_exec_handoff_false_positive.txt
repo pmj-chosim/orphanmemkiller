@@ -1,0 +1,135 @@
+==============================================================================
+Troubleshooting Story: The Detector Killed Its Own Benchmark (False Positive)
+==============================================================================
+Task #9 - overhead quantification. Found while running a clean DataLoader
+throughput benchmark with the detector attached.
+Date: 2026-08-02
+
+------------------------------------------------------------------------------
+1. SYMPTOM
+------------------------------------------------------------------------------
+Ran a plain, healthy PyTorch DataLoader throughput benchmark
+(bench_dataloader.py, num_workers=4, no crash logic at all) via
+`kubectl exec pytorch-pod -- python -u bench_dataloader.py`, with
+orphan-guard attached and scoped to the pod's cgroup (not dry-run).
+
+    Traceback (most recent call last):
+      File ".../multiprocessing/resource_sharer.py", line 138, in _serve
+        with self._listener.accept() as conn:
+      ...
+    ConnectionResetError: [Errno 104] Connection reset by peer
+    command terminated with exit code 143      <- 128+15 = SIGTERM
+
+Exit code 143 means something sent SIGTERM to our own, perfectly healthy
+benchmark process. Checked the daemon log:
+
+    [Watch] PID 1306928 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 1306929 orphaned, will check /dev/shm holding in 2s
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1306929)
+    [Watch] PID 1306952/956/960/964 orphaned, will check /dev/shm holding in 2s
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1306960)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1306964)
+
+orphan-guard genuinely believed the benchmark's own main process and two of
+its DataLoader workers were orphaned leaks, and killed them. Nothing was
+crashing. This is a real false positive.
+
+------------------------------------------------------------------------------
+2. ROOT CAUSE
+------------------------------------------------------------------------------
+`kubectl exec` (via containerd/runc) does not exec the target command
+directly under a single stable parent. It goes through a double-fork
+handoff internally (observed earlier in this project as the
+`runc:[0:PARENT] -> runc:[1:CHILD] -> <target command>` chain): an
+intermediate helper process joins the container's namespaces, forks the
+real target process, and then EXITS as soon as the target is confirmed
+running -- this is normal, expected, healthy behavior baked into how
+container runtimes implement "exec into a running container." It has
+nothing to do with a crash.
+
+Our detector's core rule is "if a tracked parent exits, its children are
+orphan candidates." It cannot distinguish "my literal creator just exited
+because that's how process handoff always works" from "my creator crashed
+and I'm now truly abandoned" -- both look identical from the kernel's
+point of view: a fork event, then very shortly after, an exit event for
+that same pid.
+
+This artifact had actually been present for the entire project, silently,
+the whole time we were using `kubectl exec` to inject workloads into
+placeholder pods (`sleep infinity` + exec). It never showed up as a
+*problem* before because in every earlier test we WANTED the target
+process to eventually get killed anyway (that was the whole point of the
+demo) -- so an early false-positive kill just meant the demo's outcome
+arrived a little earlier/differently than expected, and it went
+unnoticed. Running a benign benchmark we did NOT want killed is what
+finally exposed it.
+
+Important scope note: this is a `kubectl exec`-specific artifact of our
+own TEST METHODOLOGY. A real production deployment runs the training
+script as the pod's actual container command (its literal entrypoint),
+not injected via exec into an already-running placeholder container --
+so this specific handoff pattern would not occur in that setup. Still
+worth hardening defensively rather than assuming it can't happen elsewhere
+(e.g. some process supervisors use similar handoff patterns).
+
+------------------------------------------------------------------------------
+3. THE FIX
+------------------------------------------------------------------------------
+Added a minimum-age check: when a tracked parent exits, only consider a
+child an orphan candidate if that child has been alive for at least
+MIN_CHILD_AGE_SEC (2s). A child born a moment before its "parent" exits is
+overwhelmingly more likely to be launch-handoff noise than a real crash --
+every real leak we reproduced (zombie_maker.py, PyTorch DataLoader, Ray)
+involved a worker that had already been running normally for several
+seconds before the parent died, never microseconds.
+
+    if (now - children[i].seen_at < MIN_CHILD_AGE_SEC) {
+        printf("[Skip] PID %d is only %lds old, likely process-launch "
+               "handoff noise, not a real orphan\n", ...);
+        continue;
+    }
+
+------------------------------------------------------------------------------
+4. VERIFICATION
+------------------------------------------------------------------------------
+Re-ran the exact same benchmark 3x with the fix in place:
+
+    [Skip] PID 1317288 is only 0s old, likely process-launch handoff noise...
+    [Skip] PID 1317311 is only 1s old, likely process-launch handoff noise...
+    (etc -- handoff noise now correctly identified and ignored)
+
+    RESULT batches=200 images=12800 elapsed_s=1.0056 images_per_sec=12728.4
+    RESULT batches=200 images=12800 elapsed_s=1.0091 images_per_sec=12684.2
+    RESULT batches=200 images=12800 elapsed_s=0.9901 images_per_sec=12927.8
+
+All 3 runs completed cleanly, no process killed. Then re-verified the fix
+does NOT break real detection (zombie_maker.py scenario, freshly deployed
+daemon on the same pod): parent killed manually, worker still correctly
+caught and reclaimed within the normal grace window:
+
+    [Watch] PID 1323712/1323713 orphaned, will check /dev/shm holding in 2s
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1323713)
+    [Resolved] PID 1323713 exited or released /dev/shm during grace period
+    tmpfs            12G     0   12G   0% /dev/shm   <- fully reclaimed
+
+------------------------------------------------------------------------------
+5. LESSON LEARNED (for the talk / paper)
+------------------------------------------------------------------------------
+- The most dangerous false positives are the ones that happen to produce
+  the outcome you wanted anyway. This one was invisible for the entire
+  project until we ran a test where we specifically did NOT want the
+  target killed. Any validation suite for a "kill things automatically"
+  tool needs at least one test whose only purpose is "and nothing gets
+  killed" -- not just "does it kill the bad thing", but "does it also
+  leave everything else alone under realistic launch conditions", not just
+  synthetic ones.
+- "Parent exited" is a necessary but not sufficient signal for "orphan".
+  Process handoff during normal launch (container runtimes, supervisors,
+  daemonizing tools) legitimately produces the same kernel-level signature
+  as a crash. A minimum age requirement is a cheap, well-justified filter:
+  every real leak we found took seconds to manifest; none took
+  microseconds.
+- This is also a second, independent data point (after the mmap-vs-fd gap
+  found testing Ray) for why testing against more than one real scenario
+  matters: neither gap would have been found by re-running the same
+  synthetic zombie_maker.py test forever.

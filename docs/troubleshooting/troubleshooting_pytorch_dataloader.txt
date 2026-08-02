@@ -1,0 +1,159 @@
+==============================================================================
+Real-Workload Story: PyTorch DataLoader already partially defends itself
+==============================================================================
+Task #5 - repro Phantom Memory on torch.utils.data.DataLoader(num_workers=4)
+Date: 2026-08-02, torch 2.2.1 (CPU-only, pytorch/pytorch:latest image, AKS)
+
+------------------------------------------------------------------------------
+ATTEMPT 1: plain uncaught exception in the main process
+------------------------------------------------------------------------------
+Script raises RuntimeError at top level after 3 batches. Result:
+
+    === after script exits ===
+    Traceback (most recent call last):
+      ...
+    RuntimeError: Simulated training crash
+    === process tree ===
+        PID    PPID COMMAND
+          1       0 sleep infinity
+         86       0 ps -eo pid,ppid,args
+    === /dev/shm ===
+    tmpfs           4.0G     0  4.0G   0% /dev/shm
+
+No leak. All 4 worker processes were gone. PyTorch's DataLoader iterator
+runs its own cleanup (closes worker processes) via __del__/atexit even when
+the interpreter is unwinding from an uncaught exception.
+
+------------------------------------------------------------------------------
+ATTEMPT 2: os._exit(1) after the exception (skip interpreter cleanup)
+------------------------------------------------------------------------------
+Same script, but `except RuntimeError: os._exit(1)` instead of letting the
+exception propagate -- simulates a native crash / fatal signal that never
+runs Python-level cleanup at all.
+
+Result checked 6s later: workers were <defunct> (zombies, not reaped by
+PID 1's `sleep infinity`), /dev/shm back to 0%. Checked again with 300ms
+polling immediately after: by t+3s the whole process tree had already
+collapsed to nothing. So even os._exit() didn't produce an observable
+leak -- the workers self-terminate too fast.
+
+Root cause: torch.utils.data._utils.worker's worker loop checks
+`os.getppid()` against the manager pid it was given at spawn time, and
+exits if the parent has changed (i.e. it noticed it was reparented to
+PID 1). This is torch's own mitigation for exactly the bug class our
+detector targets, and it reacts within a very small number of loop
+iterations -- effectively sub-second in this test.
+
+------------------------------------------------------------------------------
+ATTEMPT 2b: external kill -9 on a HEALTHY main process (simulating OOM-killer)
+------------------------------------------------------------------------------
+Hypothesis going in (from external review feedback): os._exit()/uncaught
+exceptions are "shallow" self-inflicted crashes that PyTorch's watchdog can
+defend against, but a real OOM-killer's external SIGKILL on the main
+process is a fundamentally harder hit that should break through.
+
+Tested directly: a plain long-running script (dataloader_running.py, no
+self-crash logic at all) with 4 healthy, actively-running workers, killed
+externally via `kill -9 $MAIN` from a separate process (not self-inflicted).
+
+    --- before kill --- (workers 516/520/524/525 alive and running)
+    tmpfs           4.0G  172K  4.0G   1% /dev/shm
+
+    --- external kill -9 on MAIN ---
+    t+0.1s: workers alive (Sl), shm = 65M    (peak, tensors mid-flight)
+    t+0.3s: 2 of 4 workers already <defunct>, shm = 33M
+    t+0.5s: all 4 workers <defunct>, shm = 0%
+    t+1s / t+2s / t+3s / t+5s: unchanged, fully clean
+
+HYPOTHESIS REFUTED. kill -9 on a healthy main behaved identically to
+os._exit() -- full self-cleanup within half a second, faster even than our
+detector's 2-second grace window. From a worker process's point of view,
+there is no observable difference between "parent exited via uncaught
+exception", "parent called os._exit()", and "parent was SIGKILLed by an
+external OOM-killer" -- all three just mean "os.getppid() now returns 1",
+which the worker's existing polling loop catches at the same speed
+regardless of cause.
+
+CORRECTED CONCLUSION: the axis that matters is not "how violently did the
+parent die", it's "does the worker ever get to run its own Python code to
+notice". A healthy, actively-scheduled worker notices almost immediately
+no matter how the parent died. The only way we found to produce a real,
+persisting leak was ATTEMPT 3 below, where the worker itself cannot run
+any code at all.
+
+------------------------------------------------------------------------------
+ATTEMPT 3 (the one that actually works): freeze the workers before killing main
+------------------------------------------------------------------------------
+A worker that's genuinely stuck -- blocked on slow I/O, deep in a
+long-running C-extension call, or (as a clean deterministic stand-in for
+"busy and can't run its own check") SIGSTOP'd -- can never execute its own
+os.getppid() self-check, no matter how fast that check normally is or how
+the parent died. This is a realistic proxy: any worker doing real
+preprocessing/collate/decode work is not guaranteed to hit a Python-level
+check point before the process holding its identity dies.
+
+Test (single atomic script to avoid kubectl exec round-trip latency races
+-- see stuck_worker_test.sh): launch, poll for the 4 worker pids via
+`ps --ppid $MAIN`, SIGSTOP all of them, then kill -9 the main process.
+
+    --- state right after freeze+kill ---
+        PID    PPID STAT COMMAND
+          1       0 Ss   sleep infinity
+        398       1 Tl   python -u /workspace/dataloader_crash_hard.py
+        402       1 Tl   python -u /workspace/dataloader_crash_hard.py
+        406       1 T    python -u /workspace/dataloader_crash_hard.py
+        407       1 Tl   python -u /workspace/dataloader_crash_hard.py
+    tmpfs           4.0G   63M  4.0G   2% /dev/shm
+
+Real, persistent leak this time (STAT=T means stopped -- these workers are
+frozen and cannot run any Python code, including their own ppid check).
+
+orphan-guard (already running, scoped to the pod's cgroup) caught it:
+
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1119510)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1119514)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1119518)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1119519)
+    [Action] SIGKILL sent to PID 1119510 (Grace period expired)
+    [Action] SIGKILL sent to PID 1119514 (Grace period expired)
+    [Action] SIGKILL sent to PID 1119518 (Grace period expired)
+    [Action] SIGKILL sent to PID 1119519 (Grace period expired)
+
+SIGTERM was correctly ignored (a stopped process can't act on a pending
+signal until resumed), so the detector's escalation logic did exactly what
+it's designed to do: wait out the kill-grace period, re-verify the process
+is still alive and still holding /dev/shm, then SIGKILL -- which *does*
+terminate a stopped process directly, unlike SIGTERM.
+
+Confirmed after: all worker processes gone, /dev/shm back to 0%.
+
+------------------------------------------------------------------------------
+CORRECTED NARRATIVE FOR THE PAPER / CFP
+------------------------------------------------------------------------------
+WRONG (initial hypothesis, empirically refuted):
+  "Shallow crashes (exceptions, os._exit) get defended by PyTorch's
+   watchdog, but a real OOM-kill is a hard enough hit to break through."
+  -> Tested directly. False. kill -9 on a healthy main is indistinguishable
+     from os._exit() from the worker's point of view; both get cleaned up
+     in well under a second.
+
+CORRECT (confirmed by data):
+  "PyTorch's own os.getppid()-based watchdog defends equally well against
+   ANY manner of parent death (exception, os._exit, external SIGKILL /
+   OOM-kill) -- AS LONG AS the worker process is free to execute its own
+   Python code to run that check. The real, unclosed gap is workers that
+   cannot run their own code at the moment their parent dies: blocked on
+   slow I/O (network storage, NFS), deep inside a native C-extension call
+   with the GIL released (image decode, custom collate/augmentation), or
+   otherwise stuck. That is not a rare corner case in real AI training
+   pipelines -- it's routine. A kernel/eBPF-level detector's remediation
+   (SIGKILL) does not depend on the target process's ability to cooperate
+   at all, which is the actual, defensible differentiator -- not the
+   violence of the parent's death."
+
+For the paper: this is a *better* story than the original hypothesis would
+have been, precisely because it survived being tested and corrected. It
+also directly answers "why isn't a per-framework fix (PyTorch's own ppid
+check) good enough?": because it only covers the case where the worker can
+still execute code, and real production workers spend plenty of time not
+doing that.

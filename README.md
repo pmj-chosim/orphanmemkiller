@@ -27,7 +27,7 @@ monitoring sees nothing wrong.
 ## Why eBPF, and not just a containerd/CRI hook?
 
 This is the first question any experienced reviewer will ask. Short
-version — full argument in [`../cfp/why-ebpf-not-container-runtime.md`](../cfp/why-ebpf-not-container-runtime.md):
+version — full argument in [`docs/cfp/why-ebpf-not-container-runtime.md`](docs/cfp/why-ebpf-not-container-runtime.md):
 
 1. **The premise doesn't hold.** containerd hooks *pod* teardown. Phantom
    Memory's defining trait is that the pod never tears down — only an
@@ -153,15 +153,24 @@ Each real-world repro is self-contained under `repro/`:
   *same* cgroup as a repeatedly-triggered leak. `repeatability_trial.sh`
   runs the leak-and-recover cycle N times while confirming Redis/Celery
   are never touched (15/15 clean in the last run, plus a functional
-  post-check that Celery still processes real tasks afterward).
+  post-check that Celery still processes real tasks afterward). A
+  separate N=15 statistical run measuring time-to-reclaim is in
+  [`results/repeatability_stats.txt`](results/repeatability_stats.txt)
+  (100% success, mean 2.11s, stdev 0.31s — SIGTERM alone was sufficient
+  in every trial, SIGKILL escalation was never needed in this run).
 
-See `../troubleshooting/` for the detailed, warts-and-all debugging
+See [`docs/troubleshooting/`](docs/troubleshooting/) for the detailed, warts-and-all debugging
 stories behind several of these (a nanoseconds-vs-clock-ticks unit bug
 that silently disabled a safety check, a coverage gap between `/proc/*/fd`
 and `/proc/*/maps`, and a test harness bug that made a *working* detector
 look broken).
 
 ## Known limitations
+
+Full writeup — kernel version/CO-RE floors, overhead edge cases, and which
+Kubernetes environments this cannot run in at all (Fargate, gVisor/Kata,
+restrictive Pod Security Admission) — in
+[`docs/cfp/limitations.md`](docs/cfp/limitations.md). Summary:
 
 - **Kernel-level observation alone can't infer intent.** A legitimately
   long-lived, intentionally-detached daemon and a leaked worker look

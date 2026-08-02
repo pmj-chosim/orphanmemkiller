@@ -1,0 +1,36 @@
+Statistical repeatability trial (Task #14), 2026-08-02
+Same setup as Task #10 (Redis + Celery worker pool running in the same
+cgroup as the leak target throughout), --enforce mode, N=15.
+
+Per-trial: launch zombie_maker.py-equivalent (leak_maker.py, 100MB),
+wait for worker spawn, let it run 3s (clear of the 2s launch-handoff
+guard), kill -9 the parent, poll /dev/shm every 0.25s until it drops
+back to baseline (<=2MB) or 15s timeout, record elapsed time.
+
+RESULT: 15/15 reclaimed (100% success rate), 0 failures, 0 timeouts.
+Redis responded PONG after every single trial. Celery worker pids
+unchanged throughout (separately re-verified functional with a real
+task round-trip after the run, see Task #10 notes).
+
+Time-to-reclaim (parent kill -> /dev/shm back to baseline), seconds:
+  2.03, 1.52, 2.28, 2.28, 2.28, 2.28, 1.52, 2.28, 2.28, 2.28,
+  2.29, 1.52, 2.28, 2.29, 2.28
+
+  n=15  mean=2.113s  median=2.280s  stdev=0.313s  min=1.52s  max=2.29s
+
+Interpretation: the distribution clusters tightly around ~2.28s, which
+is exactly GRACE_WINDOW_SEC (2s) plus one ~0.25s polling-loop increment
+-- i.e. in every one of these 15 trials, SIGTERM alone was sufficient
+(the worker exited cleanly on the first signal, releasing its /dev/shm
+reference as an ordinary side effect of process exit) and the escalation
+to SIGKILL after KILL_GRACE_SEC was never needed. The three 1.52s
+outliers are the same shape, just caught by the poller's 0.25s
+granularity one tick earlier. No trial ever needed the full
+grace+kill-grace (2s+3s=5s) escalation path in this run -- worth
+re-running with a worker that ignores SIGTERM (or is SIGSTOP'd, per
+repro/pytorch/stuck_worker_test.sh) if a "worst case, SIGKILL path"
+latency number is needed for the paper.
+
+Caveat: this is one N=15 run on one cluster/kernel (6.8.0-1059-azure,
+Standard_D4s_v5). Treat as a real, honest characterization of *this*
+setup, not a general SLA claim.

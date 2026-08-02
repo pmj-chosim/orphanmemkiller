@@ -1,0 +1,182 @@
+==============================================================================
+Troubleshooting Story #3: The PID-Reuse Guard That Silently Broke Everything
+==============================================================================
+Project: orphan-guard (Phantom Memory eBPF detector/remediator)
+Date: 2026-08-02
+Component: orphan_guard.c (userspace daemon), sweep_candidates()/same_process()
+
+------------------------------------------------------------------------------
+1. WHY WE ADDED THIS CODE IN THE FIRST PLACE
+------------------------------------------------------------------------------
+Earlier review feedback (from a colleague's technical read of the detection
+design) flagged a real correctness risk: our candidate tracking uses a
+multi-second grace window (SIGTERM -> wait -> re-check -> SIGKILL). A PID is
+just a number, and Linux reuses PID numbers once they're freed. If, during
+that grace window, the original process fully exits AND a completely
+unrelated new process gets assigned the exact same PID number, our sweep
+could send SIGTERM/SIGKILL to the WRONG, unrelated process -- a real safety
+bug for anything that claims to be production-grade.
+
+The fix we designed: record the process's start time when we first see it
+(from the fork event), and before ever acting on that PID later, re-verify
+that the *currently running* process at that PID has the *same* start time.
+If it doesn't match, the PID was recycled -- treat it as "gone", do nothing.
+
+------------------------------------------------------------------------------
+2. THE BUG: unit mismatch (silent, no crash, no error -- just total silence)
+------------------------------------------------------------------------------
+Implementation, first pass:
+  - BPF side (orphan_guard.bpf.c): read the new task's start time via
+    `BPF_CORE_READ(child, start_time)` off the kernel's task_struct, and
+    forward it to userspace inside the ring-buffer fork/exit event.
+  - Userspace side (orphan_guard.c): parse `/proc/<pid>/stat` field 22
+    (starttime) ourselves, and compare it against the value we received
+    from BPF.
+
+This compiled cleanly, ran with zero errors, and produced [Watch] log lines
+exactly as expected. That's what made it dangerous to debug: there was no
+crash, no error return, no BPF verifier rejection -- just candidates that
+were tracked, and then silently vanished without ever escalating.
+
+SYMPTOM (real captured log, --cgroup 51742, real AKS cluster):
+
+    $ kubectl exec zombie-pod -- kill -9 34      # kill the real parent
+    ... waited 6+ seconds (grace window is only 2s) ...
+
+    orphan-guard running (dry_run=0)
+    [Watch] PID 946007 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 946005 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 946013 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 946178 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 946177 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 950911 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 950910 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 946017 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 946018 orphaned, will check /dev/shm holding in 2s
+
+    -- NOT ONE [Alert] or [Action] line, ever. --
+
+    $ kubectl exec zombie-pod -- df -h /dev/shm
+    Filesystem      Size  Used Avail Use% Mounted on
+    tmpfs            12G  300M   12G   3% /dev/shm      <-- leak never reclaimed
+
+    $ kubectl exec zombie-pod -- ps -eo pid,ppid,args
+        PID    PPID COMMAND
+          1       0 sleep infinity
+         39       1 python -u /workspace/leak_maker.py 300   <-- worker still alive
+
+Every single tracked candidate was being silently dropped before it ever
+reached the shm-holding check, let alone SIGTERM. The detector *looked*
+alive (it logged [Watch] lines, proving fork/exit events and cgroup scoping
+were all still working correctly from the earlier fix), but the safety
+feature we'd just added had completely neutered the remediation path.
+
+------------------------------------------------------------------------------
+3. ROOT CAUSE
+------------------------------------------------------------------------------
+Two different clocks, both called "start time", silently incompatible:
+
+  - `task_struct->start_time` (read in-kernel via BPF_CORE_READ) is stored
+    in NANOSECONDS since boot.
+  - `/proc/<pid>/stat` field 22 (the value userspace tools, including our
+    own re-check function, conventionally parse) is expressed in
+    CLOCK TICKS since boot (USER_HZ, typically 100/sec on Linux).
+
+  same_process() compared these two numbers directly:
+
+      cur = get_start_time(pid);           // clock ticks, e.g. 8934512
+      return cur != 0 && cur == recorded;  // recorded came from BPF: nanoseconds, e.g. 89345120000000
+
+  cur == recorded was false for every single process, every single time --
+  by roughly 7 orders of magnitude, never by coincidence. Every candidate
+  was therefore judged "not the same process anymore" on its very first
+  check and discarded, before the shm-holding check or SIGTERM ever ran.
+
+This is exactly the kind of bug automated tests would NOT have caught with
+a "does it compile / does it not crash" bar -- it required actually kill -9
+'ing a real orphan on the real cluster and noticing the *absence* of a log
+line and the *absence* of memory reclaim.
+
+------------------------------------------------------------------------------
+4. THE FIX
+------------------------------------------------------------------------------
+Stop trying to reconcile two different units from two different
+measurement points. Instead, make the "recorded" and "re-checked" values
+come from the exact same function, so there is only one unit in play:
+
+    BEFORE (handle_event, on a FORK event):
+        track_child((int)e->pid, (int)e->ppid, e->start_time);
+        //                                      ^^^^^^^^^^^^^ from BPF, nanoseconds
+
+    AFTER:
+        track_child((int)e->pid, (int)e->ppid, get_start_time((int)e->pid));
+        //                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^ same
+        //                                      /proc parser used later, clock ticks
+
+get_start_time() is the same userspace function used later inside
+same_process() to re-check. Recording and re-checking now always compare
+"clock ticks per get_start_time()" against "clock ticks per
+get_start_time()" -- consistent units, by construction, with no cross-layer
+reconciliation needed. The BPF-side start_time field is left in the event
+struct (harmless, possibly useful later) but is no longer used for the
+userspace comparison.
+
+------------------------------------------------------------------------------
+5. VERIFICATION (real captured log, same cluster, after the fix, fresh pod)
+------------------------------------------------------------------------------
+    $ kubectl exec zombie-pod -- kill -9 76      # real parent
+
+    orphan-guard running (dry_run=0)
+    [Watch] PID 955077 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955076 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955113 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955112 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955119 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955120 orphaned, will check /dev/shm holding in 2s
+    [Alert] SIGTERM sent to Orphan Worker (PID: 955120)
+    [Watch] PID 955124 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955125 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955182 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955181 orphaned, will check /dev/shm holding in 2s
+    [Alert] SIGTERM sent to Orphan Worker (PID: 955125)
+    [Watch] PID 955200 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955199 orphaned, will check /dev/shm holding in 2s
+    [Resolved] PID 955120 exited or released /dev/shm during grace period
+    [Resolved] PID 955125 exited or released /dev/shm during grace period
+    [Watch] PID 955342 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 955341 orphaned, will check /dev/shm holding in 2s
+
+    $ kubectl exec zombie-pod -- df -h /dev/shm
+    Filesystem      Size  Used Avail Use% Mounted on
+    tmpfs            12G     0   12G   0% /dev/shm      <-- fully reclaimed
+
+    $ kubectl exec zombie-pod -- ps -eo pid,ppid,args
+        PID    PPID COMMAND
+          1       0 sleep infinity
+        100       0 ps -eo pid,ppid,args              <-- worker is gone
+
+Cross-checked at the same time (must stay untouched, different cgroup):
+    legit-daemon-pod: still alive, still holding 64MB /dev/shm (intentional
+                       double-fork daemon, structurally identical "orphan"
+                       shape, correctly left alone)
+    redis-control:    still running (PID 1, State: S sleeping), untouched
+
+------------------------------------------------------------------------------
+6. LESSON LEARNED (for the talk / paper)
+------------------------------------------------------------------------------
+- A safety feature that fails silently is worse than not having it: it adds
+  the *appearance* of maturity (a real PID-reuse guard!) while quietly
+  disabling remediation entirely. The failure mode wasn't "detector too
+  aggressive", it was "detector polite to the point of catatonia" --
+  arguably a worse look for a production-safety pitch than the bug it was
+  meant to prevent.
+- Mixed time units (ns vs. clock ticks; boot-time-relative vs. wall-clock)
+  between a kernel-side eBPF read and a userspace /proc parse are an easy,
+  quiet trap: both sides compile, both sides "work" in isolation, and
+  nothing errors -- the mismatch only shows up as behavior that's just
+  slightly, suspiciously *too* conservative.
+- The fix in hindsight is the more obviously-correct design anyway: don't
+  pipe a kernel-measured value through the ring buffer just to compare it
+  against a userspace-measured value later -- measure both ends with the
+  *same* function so there's only one unit, by construction, not by
+  convention.

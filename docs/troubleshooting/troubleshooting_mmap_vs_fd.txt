@@ -1,0 +1,132 @@
+==============================================================================
+Troubleshooting Story: Detector Missed a Leak It Should Have Caught (mmap vs fd)
+==============================================================================
+Task #6 - repro Phantom Memory on Ray's plasma object store
+Date: 2026-08-02, Ray 2.56.1 (CPU-only, python:3.11-slim + pip install ray)
+
+------------------------------------------------------------------------------
+1. THE REPRO (worked immediately, no tricks needed)
+------------------------------------------------------------------------------
+Unlike PyTorch's DataLoader (see troubleshooting_pytorch_dataloader.txt),
+Ray has no equivalent self-healing watchdog. A driver script that calls
+ray.init() + ray.put(large_array) spawns a process tree:
+
+    driver (ray_driver.py)
+    +-- gcs_server
+    +-- monitor.py
+    +-- dashboard.py
+    +-- log_monitor.py
+    +-- raylet  --plasma_directory=/dev/shm
+        +-- ray::DashboardAgent
+        +-- ray::RuntimeEnvAgent
+        +-- ray::IDLE x4   (prestarted worker pool)
+
+Killing the driver (`kill -9`) orphans this whole tree. raylet itself
+appears to notice and exit within a few seconds, but its own children
+(the ray:: worker processes) are left behind, reparented to PID 1, with
+no equivalent check of their own. Simple, no SIGSTOP/freeze trick needed
+-- this is Ray's actual default behavior on a plain crashed driver.
+
+------------------------------------------------------------------------------
+2. THE BUG: our own detector silently failed to catch it
+------------------------------------------------------------------------------
+First attempt: killed the driver, waited, checked the orphaned ray::IDLE
+workers -- `df -h /dev/shm` still showed 20M used, but orphan-guard logged
+plenty of [Watch] lines and NOT ONE [Alert] for the actual worker pids.
+
+Investigated directly:
+
+    $ kubectl exec ray-pod -- ls -la /dev/shm/
+    total 0
+    drwxrwxrwt 2 root root 40 ... .
+    drwxr-xr-x 5 root root 360 ... ..
+    (empty -- no visible file, yet df -h reports 20M used)
+
+    $ grep -i shm /proc/<worker_pid>/maps
+    77d843800000-77d850000000 rw-s 00000000 00:168 3  /dev/shm/plasmahELf7T (deleted)
+
+The file was unlink()ed (hence invisible to `ls`, and hence "(deleted)" in
+the maps line), but the memory pages are still alive because a MEMORY
+MAPPING into it survives independent of any open file descriptor. Checked
+/proc/<pid>/fd for the same worker: no /dev/shm entry there at all.
+
+Root cause: our holds_shm() only ever scanned /proc/<pid>/fd (open file
+descriptors). Ray's plasma client follows an entirely ordinary, valid
+pattern -- shm_open()/open() the backing file, mmap() it, then close() the
+fd, since the mapping alone is sufficient to keep using the memory. This
+is common practice (also how CPython's own mmap module and many C shared-
+memory libraries are typically used) -- our detector had a blind spot for
+any process using this pattern, and would have silently never fired for
+it, indefinitely.
+
+This is a different kind of bug than the pid-reuse/units mismatch story:
+that one was a fully-implemented feature failing loudly-if-you-look
+(logs went silent). This one is a *coverage gap* -- the feature works
+exactly as designed, just for a narrower definition of "holds shared
+memory" than actually exists in the wild.
+
+------------------------------------------------------------------------------
+3. THE FIX
+------------------------------------------------------------------------------
+Added a second check, holds_shm_map(), that scans /proc/<pid>/maps for any
+mapped region backed by a /dev/shm path (works whether the file is still
+linked or already unlink()ed -- the mapping line shows the path either
+way, with "(deleted)" appended if unlinked). holds_shm() now returns true
+if EITHER the fd scan or the maps scan finds a /dev/shm reference:
+
+    static int holds_shm(int pid) {
+        int viaFd = holds_shm_fd(pid);
+        if (viaFd < 0) return -1;
+        if (viaFd > 0) return 1;
+        return holds_shm_map(pid) > 0;
+    }
+
+------------------------------------------------------------------------------
+4. VERIFICATION (after the fix, fresh Ray session)
+------------------------------------------------------------------------------
+    $ kubectl exec ray-pod -- kill -9 888   # driver
+
+    [Watch] PID 1262489 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 1262490 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 1262491 orphaned, will check /dev/shm holding in 2s
+    [Watch] PID 1262492 orphaned, will check /dev/shm holding in 2s
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1262489)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1262490)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1262491)
+    [Alert] SIGTERM sent to Orphan Worker (PID: 1262492)
+    [Resolved] PID 1262489 exited or released /dev/shm during grace period
+    [Resolved] PID 1262490 exited or released /dev/shm during grace period
+    [Resolved] PID 1262491 exited or released /dev/shm during grace period
+    [Resolved] PID 1262492 exited or released /dev/shm during grace period
+
+    $ kubectl exec ray-pod -- ps -eo pid,ppid,args
+        PID    PPID COMMAND
+          1       0 sleep infinity
+       1208       0 ps -eo pid,ppid,args
+    $ kubectl exec ray-pod -- df -h /dev/shm
+    tmpfs           4.0G     0  4.0G   0% /dev/shm
+
+All 4 orphaned ray:: workers caught and cleaned via SIGTERM alone (no
+SIGKILL escalation needed this time -- they exited gracefully once
+signaled). Full reclaim confirmed.
+
+------------------------------------------------------------------------------
+5. LESSON LEARNED (for the talk / paper)
+------------------------------------------------------------------------------
+- "Holds shared memory" is not a single, simple predicate -- it has at
+  least two independent kernel-level manifestations (open file descriptor
+  vs. active memory mapping), and different real-world libraries use
+  different ones. A detector validated against only one workload (our
+  original synthetic zombie_maker.py, and even PyTorch's DataLoader) can
+  look completely correct and still have a blind spot that only a second,
+  independently-chosen real workload exposes.
+- This is a direct, concrete argument for the "test against multiple
+  real-world workloads" requirement the original eBPF'26 reviewers raised
+  (reviewer 21C: "evaluate based on multiple real-world workloads") -- it
+  is not just about proving frequency/severity across frameworks, it also
+  catches implementation gaps that a single workload's specific IPC
+  pattern would never surface.
+- df -h reporting usage with nothing visible under `ls` is itself a useful
+  diagnostic signature worth remembering: it means the backing file was
+  unlinked and something still has it mapped -- check /proc/*/maps, not
+  /proc/*/fd, to find the holder.
