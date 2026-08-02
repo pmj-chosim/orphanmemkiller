@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pytorch-pod
+spec:
+  containers:
+  - name: pytorch
+    image: pytorch/pytorch:latest
+    command: ["sleep","infinity"]
+    volumeMounts:
+    - mountPath: /dev/shm
+      name: dshm
+  volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 4Gi

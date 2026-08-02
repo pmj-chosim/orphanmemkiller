@@ -1,0 +1,65 @@
+Overhead measurements (Task #9), 2026-08-02, AKS koreacentral, Standard_D4s_v5, kernel 6.8.0-1059-azure
+
+=== 1. PyTorch DataLoader throughput (the metric that matters to an ML audience) ===
+bench_dataloader.py: num_workers=4, batch_size=64, tensor_size=65536 floats/item,
+200 batches timed after a 10-batch warmup.
+
+Baseline (no eBPF probe attached):
+  run1: elapsed=1.0403s  images/sec=12304.1
+  run2: elapsed=1.0103s  images/sec=12669.4
+  avg: ~12486.8 images/sec
+
+With orphan-guard attached (scoped to the pod's cgroup, actively watching):
+  run1: elapsed=1.0056s  images/sec=12728.4
+  run2: elapsed=1.0091s  images/sec=12684.2
+  run3: elapsed=0.9901s  images/sec=12927.8
+  avg: ~12780.1 images/sec
+
+Delta: +2.3% vs baseline -- i.e. statistically indistinguishable from zero;
+the "increase" is run-to-run noise, not a real speedup. Sample size is
+small (2-3 runs/side); the honest claim is "no measurable throughput
+overhead," not a precise percentage.
+
+Why this makes sense architecturally: the probe only hooks
+tp_btf/sched_process_fork and tp_btf/sched_process_exit -- events that
+fire once per process creation/destruction. A DataLoader with
+persistent_workers=True creates its 4 worker processes ONCE and reuses
+them for the entire run; batch fetching itself goes through queues/shared
+memory the probe never touches. There is essentially nothing for the
+probe to do during steady-state batch iteration.
+
+=== 2. Fork/exit microbenchmark (worst case for our specific mechanism) ===
+fork_stress.sh: 3000x fork+exec+exit of /bin/true in a tight loop (`time`
+built-in), on zombie-pod.
+
+Baseline (no eBPF probe attached):
+  run1: real=1.558s
+  run2: real=1.555s
+  avg: ~1.5565s
+
+With orphan-guard attached (scoped to the pod's cgroup):
+  run1: real=1.731s
+  run2: real=1.665s
+  avg: ~1.698s
+
+Delta: ~+9.1% wall-clock under a synthetic fork-storm (3000
+processes/~1.5s, i.e. ~2000/sec sustained creation+teardown rate) --
+a workload no realistic AI training/serving process resembles. This
+number exists to be honest about the mechanism's cost under an adversarial
+load, not because any real workload looks like this.
+
+=== 3. Why we don't need to also re-benchmark the old (abandoned) polling design ===
+The original bpftrace prototype hooked `nanosleep`/`select`/`pselect6`
+tracepoints -- syscalls a sleeping/idle process calls continuously,
+potentially thousands of times per second per process, node-wide.
+sched_process_fork/exit fire only at process creation/destruction, a rate
+that is orders of magnitude lower for any real workload. This is a
+structural difference in hook frequency, not something that needs a
+side-by-side rebuild of the abandoned design to demonstrate.
+
+=== Sample size caveat (be upfront about this, don't hide it) ===
+2-3 runs per condition is a rough characterization, not a rigorous
+statistical result. If this needs to survive a skeptical senior reviewer's
+question, re-run each condition ~10-20x and report mean+stddev before
+using these numbers in the paper's results table. Track under Task #14
+(statistical repeatability).

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ray-pod
+spec:
+  containers:
+  - name: ray
+    image: python:3.11-slim
+    command: ["sleep","infinity"]
+    volumeMounts:
+    - mountPath: /dev/shm
+      name: dshm
+  volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 4Gi

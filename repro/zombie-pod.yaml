@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: zombie-pod
+spec:
+  containers:
+  - name: zombie
+    image: continuumio/miniconda3
+    command: ["sleep","infinity"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - mountPath: /dev/shm
+      name: dshm
+  volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 12Gi
