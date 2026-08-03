@@ -5,11 +5,14 @@ worker processes — reparented to PID 1 after their parent dies — that keep
 holding `/dev/shm` shared-memory segments the kernel will never reclaim on
 its own, while the pod they're in keeps running and reporting healthy.
 
-Status as of 2026-08-02: core detection + remediation loop is implemented,
-tested against a synthetic reproduction and two independent real-world
-workloads (PyTorch DataLoader, Ray), validated for false positives against
+Status as of 2026-08-03: core detection + remediation loop is implemented,
+tested against a synthetic reproduction and three independent real-world
+workloads (PyTorch DataLoader, Ray, and a real Jupyter kernel via
+`jupyter_client.KernelManager`), validated for false positives against
 real background services (Redis, Celery) sharing the same cgroup as the
-leak, and defaults to a safe, log-only posture. Not yet packaged as an
+leak, ships with an allowlist policy (`--exempt <pid>` and a
+`orphan-guard.io/exempt` pod annotation — see **Safety policy** below),
+and defaults to a safe, log-only posture. Not yet packaged as an
 installable artifact — see **Known limitations** below.
 
 ## Why this exists
@@ -77,12 +80,16 @@ version — full argument in [`docs/cfp/why-ebpf-not-container-runtime.md`](docs
   wait, re-verify via `/proc/<pid>/stat` start time (guards against PID
   reuse during the grace window), escalate to SIGKILL only if still
   alive and still holding `/dev/shm`.
-- A newly-tracked child is ignored for its first ~2 seconds
-  (`MIN_CHILD_AGE_SEC`): container runtimes commonly double-fork
+- On a tracked parent's exit, its children are ignored as orphan
+  candidates if the *parent itself* was younger than ~2 seconds
+  (`MIN_PARENT_AGE_SEC`): container runtimes commonly double-fork
   internally and have the intermediate process exit right after the real
   target starts — normal, healthy launch handoff, not a crash. Confirmed
   in practice: without this guard, the agent killed its own benchmark
-  process.
+  process. Gating on the parent's own age rather than the child's matters:
+  a real orphan can be born only moments before a longer-lived parent
+  crashes (confirmed with a live Jupyter kernel killed seconds after
+  starting a DataLoader) and must still be caught.
 
 ### Safety policy
 
@@ -156,6 +163,16 @@ Each real-world repro is self-contained under `repro/`:
   into the plasma object store; a plain `kill -9` on the driver orphans
   the `ray::IDLE` worker pool with no self-healing at all, and
   `orphan-guard` reclaims it cleanly.
+- **`repro/jupyter/`** — a real `jupyter_client.KernelManager`-launched
+  kernel running a real, `persistent_workers=True` PyTorch DataLoader
+  (`jupyter_worker_freeze_test.py`), one worker frozen with `SIGSTOP`,
+  then the kernel killed with a direct `SIGKILL` to its pid (not
+  `restart_kernel()`, which calls `killpg()` and would kill the frozen
+  worker directly — see the storyboard doc for why that path was ruled
+  out). This scenario is what surfaced the parent-vs-child age bug fixed
+  in the guard described above: workers this fresh out of a
+  `persistent_workers` DataLoader can legitimately be younger than the
+  handoff-noise threshold, and still be real orphans.
 - **`repro/celery/`** — the adversarial false-positive test: a real
   `redis-server` + Celery worker pool (concurrency=4) running in the
   *same* cgroup as a repeatedly-triggered leak. `repeatability_trial.sh`
@@ -197,8 +214,8 @@ restrictive Pod Security Admission) — in
   cgroup scoping) was never fully root-caused. Worth revisiting.
 - **Not yet packaged** as a container image, Helm chart, or systemd unit —
   currently a manually-built binary you run with an explicit `--cgroup`.
-- **A 2-second minimum child age is a deliberate false-positive/detection-latency
-  tradeoff.** A crash that happens to occur within 2 seconds of a worker's
-  own birth will currently be missed. Every real leak we reproduced took
-  seconds, not milliseconds, to matter — but this is a real, documented
-  gap, not a free lunch.
+- **A 2-second minimum parent age is a deliberate false-positive/detection-latency
+  tradeoff.** A parent that crashes within 2 seconds of its own launch will
+  currently have its children missed. Every real leak we reproduced
+  involved a parent that had itself been alive for several seconds before
+  crashing — but this is a real, documented gap, not a free lunch.

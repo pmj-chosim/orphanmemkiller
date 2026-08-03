@@ -1,8 +1,9 @@
 # Limitations
 
 This project works, and we have empirical evidence for it (synthetic
-reproduction, two independent real-world workloads, 0% false positives
-against real background services sharing the same cgroup as the leak).
+reproduction, three independent real-world workloads — PyTorch DataLoader,
+Ray, and a real Jupyter kernel — 0% false positives against real
+background services sharing the same cgroup as the leak).
 None of that makes it complete. Below is what we know doesn't hold, have
 not verified, or have deliberately traded away — organized the way a
 skeptical reviewer would probe it, not the way that reads best.
@@ -183,23 +184,86 @@ worker — both are: live process, reparented to PID 1, holding shared
 memory. We built and tested exactly this adversarial case
 (`repro/legit-daemon-pod.yaml`) and it is correctly left alone today, but
 only because it happens to live in a different, unwatched cgroup. Within
-the *same* watched scope, today's only mitigation is a manual `--exempt
-<pid>` allowlist — there is no annotation/label-based policy yet for
-"this workload is expected to daemonize, do not touch it," which is the
-mechanism a real production deployment would actually need.
+the *same* watched scope, two mitigations ship today: a manual `--exempt
+<pid>` allowlist for a known pid, and a pod-level `orphan-guard.io/exempt:
+"true"` annotation — checked once at startup against the in-cluster K8s
+API (via `--namespace`/`--pod-name`) and, if present, forces permanent
+dry-run for that run regardless of `--enforce`. This covers "this
+workload is expected to daemonize, do not touch it" for the pod-lifetime
+scope this project targets; it is checked once at startup, not
+re-polled, so an annotation added/removed after the daemon is already
+running does not take effect until the next restart.
 
 ## 5. One deliberate detection/safety tradeoff, stated plainly
 
-A newly-observed child is ignored as an orphan candidate for its first
-`MIN_CHILD_AGE_SEC` (2) seconds after its tracked parent exits — added
-specifically because container-runtime launch handoff (a normal,
-healthy `runc exec` double-fork pattern, not a crash) produces the same
-kernel-level signature as a real orphan event, and without this guard the
-agent killed its own benchmark process during testing. The tradeoff this
-buys: **a crash that happens to occur within 2 seconds of a worker's own
-birth will currently not be detected.** Every real leak we reproduced
-(the synthetic script, PyTorch DataLoader, Ray) involved a worker that
-had been running normally for several seconds before anything crashed —
+An exiting process's children are ignored as orphan candidates if the
+exiting process itself was younger than `MIN_PARENT_AGE_SEC` (2) seconds
+old — added specifically because container-runtime launch handoff (a
+normal, healthy `runc exec` double-fork pattern, not a crash) produces the
+same kernel-level signature as a real orphan event, and without this guard
+the agent killed its own benchmark process during testing. This check is
+on the age of the *exiting parent*, not its children: an earlier version
+gated on the child's age instead, which meant a real orphan born only
+moments before a longer-lived parent's crash (confirmed in practice with a
+live Jupyter kernel killed seconds after starting a DataLoader) was wrongly
+treated as handoff noise and never caught. The remaining tradeoff:
+**a parent that crashes within 2 seconds of its own launch will still not
+have its children flagged.** Every real leak we reproduced (the synthetic
+script, PyTorch DataLoader, Ray, and the Jupyter kernel case) involved a
+parent that had itself been alive for several seconds before crashing —
 but that is a property of the workloads we tested, not a guarantee about
 all workloads, and this is a real, live gap in coverage, not just a
 theoretical one.
+
+### Q&A defense: why this isn't a tunable knob we just forgot to lower
+
+The 2-second floor isn't a magic number we picked and could shrink for a
+better demo — it's a lower bound set by how container runtimes actually
+launch processes on every standard Kubernetes node. `runc`'s exec/create
+path is a **double-fork handoff**: an intermediate process joins the
+target's namespaces, forks the real target, and exits — and step three
+happens on the order of **milliseconds**, not seconds, because it's just a
+namespace-join and a fork, no I/O, no scheduling contention in the
+common case. A detector with *no* age floor sees that intermediate exit
+and a fork event that's microseconds old, and cannot distinguish it from
+a real crash by the kernel-level signature alone — `sched_process_fork`
+followed by `sched_process_exit` for the same pid looks identical either
+way; we don't get "handoff" or "crash" as a field, we get a timestamp.
+So the real design question isn't "should there be a floor," it's "how
+low can the floor go before it clips into runtime-handoff jitter" — and
+we measured that jitter empirically (the false-positive that killed our
+own benchmark, see `docs/troubleshooting/`) rather than guessing it. 2
+seconds is roughly **three orders of magnitude above the millisecond-scale
+handoff window** we observed — comfortable headroom against scheduler
+jitter on a loaded node, while still being short enough that it only
+costs detection latency for a crash that happens to land in the first two
+seconds of a process's life, which every real leak we've reproduced
+across three independent workloads did not. If a reviewer asks "why not
+0.5s" or "why not adaptive": adaptive is the honest next step (e.g.
+learning the actual node's handoff latency at startup instead of a fixed
+constant), but it adds a calibration phase and a new failure mode (a
+misjudged calibration reopens the exact hole this guard closes) for a
+project whose current job is proving the *detection mechanism* works, not
+shipping a self-tuning production system. That's a real, stated scope
+limit, not a dodge.
+
+## 6. The capability floor — what this approach categorically requires
+
+This is not a shortlist of environments we haven't gotten to yet; it's
+the minimum substrate CO-RE eBPF tracepoints on `sched_process_fork`/
+`sched_process_exit` require to exist *at all*. No amount of engineering
+time closes these without abandoning the eBPF approach entirely:
+
+- **A real Linux kernel exposing BTF for the running kernel** (`/sys/kernel/btf/vmlinux`), i.e. a standard Kubernetes worker node. **Fargate** does not qualify — AWS does not expose kernel BPF program loading to Fargate tasks at all; there is no kernel to attach to from inside the task.
+- **cgroup v2**, for `bpf_get_current_cgroup_id()`-based scoping. A cgroup v1-only host changes the cgroup-id semantics this project's scoping mechanism depends on — untested, and not assumed to work.
+- **`CAP_BPF`/`CAP_SYS_ADMIN`** and BPF program loading permitted for the pod — meaning a **privileged pod** (or a host-level agent), not a normal application pod under a default Pod Security Admission policy. A cluster enforcing the `restricted` PSA profile on this namespace is, by design, refusing exactly the capability this tool needs.
+- **The workload's tracepoints firing in a kernel this eBPF program can attach to** — a **gVisor (GKE Sandbox) or Kata Containers** runtime interposes its own kernel (gVisor) or a real guest kernel (Kata) between the workload and the host kernel `sched_process_fork`/`exit` never fires for the sandboxed process on the host kernel we can see, because the process isn't actually running there.
+
+None of these are bugs to be fixed in a future version — they are the
+definition of the environment eBPF-based observation requires. The
+correct framing for a reviewer or an operator evaluating this tool: **if
+your node is a standard Kubernetes worker node on cgroup v2 with BPF
+enabled and you can run a privileged pod on it, this works. If it isn't,
+no version of this specific approach will** — a Kubernetes-runtime-level
+or per-framework fix (imperfect as those are, per the rest of this
+document) is the only option in those environments.

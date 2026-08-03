@@ -87,4 +87,3 @@ gap in about two seconds.
 
 - [ ] Confirm actual word-limit/field structure for the target CFP form (OSS Japan Sessionize, or whichever venue this goes to first) and trim the abstract to fit
 - [ ] Decide whether the live demo travels well for a given venue's AV setup, or needs a pre-recorded backup (see the demo storyboard doc for a recording plan)
-- [ ] Read the "Taming the Memory Beast" arXiv paper in full before citing it (see `evidence-citations.md` — scope not yet independently verified)

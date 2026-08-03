@@ -78,12 +78,17 @@ print(f"worker {victim} frozen — it can no longer run its own os.getppid() sel
 > Python — including the one line of Python that would have saved it."
 
 **Beat 4 — the crash (the "everyone in the audience has done this" moment, 15s)**
-Click **Kernel → Restart Kernel** in the Jupyter UI itself (not a
-terminal command — the visual of clicking the actual button the audience
-recognizes is the point).
-> "Every data scientist in this room has clicked this button. Right now,
-> that's the Linux OOM-killer, or your own thumb — it doesn't matter
-> which. The kernel process just died."
+Do **not** click Kernel → Restart Kernel — confirmed in testing that it
+calls `killpg()` on the kernel's whole process group, which would kill the
+frozen worker directly and skip orphan-guard entirely. Instead, stay in
+Pane A and run this in a new notebook cell:
+```python
+import os, signal
+os.kill(os.getpid(), signal.SIGKILL)
+```
+> "In dev, everyone clicks 'Restart Kernel'. But in production, the Linux
+> OOM-killer isn't that graceful. It doesn't kill the whole process
+> group — it just snipes the heaviest process with SIGKILL. Like this."
 
 **Beat 5 — show the damage (20s)**
 Point at Pane B: the frozen worker (state `T`) is now `ppid=1`, still
@@ -130,10 +135,19 @@ process disappears from Pane B.
 
 ## Build status
 
-This storyboard is written against mechanisms we've already tested
-(`stuck_worker_test.sh`, the audit log format, the escalation timing from
-`results/repeatability_stats.txt`). **Not yet done:** actually standing up
-a Jupyter server on the cluster and rehearsing the notebook-UI version of
-"restart kernel" end to end — everything so far has used a raw script and
-`kill -9`, not clicking the actual Jupyter Restart Kernel button. That's
-the next concrete step if this demo gets greenlit for a specific venue.
+This storyboard is written against mechanisms we've already tested end to
+end on the real cluster: a real `jupyter_client.KernelManager`-launched
+kernel running a real PyTorch DataLoader (`persistent_workers=True`,
+`num_workers=4`), one worker frozen with `SIGSTOP`, then a direct
+`SIGKILL` to the kernel pid — reproducing Beat 4 exactly (not the UI
+button, which was tried and ruled out: it calls `killpg()` and kills the
+frozen worker directly, so orphan-guard never gets a chance to catch it).
+First attempt at this exact scenario missed the frozen worker (root cause:
+the daemon's own anti-false-positive age guard was keyed off the child's
+age instead of the exiting parent's — fixed in `src/orphan_guard.c`, see
+git history). Re-run after the fix: both healthy self-healing and the
+frozen-worker catch (`WATCH` → `SIGTERM_SENT` → `SIGKILL_SENT`) confirmed
+working. Remaining: rehearsing the *visual* Jupyter-notebook-UI version
+(this was validated via the underlying `jupyter_client` API, not by typing
+into an actual browser-rendered notebook) — do that pass before the
+venue-specific rehearsal.

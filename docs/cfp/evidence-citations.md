@@ -78,13 +78,15 @@ actually bites real operators" framing): a documented case of a pod using
 normal — matching our own point that `/dev/shm` usage is invisible to
 standard heap/RSS-based monitoring.
 
-Also: an arXiv paper (Dec 2024), *"Taming the Memory Beast: Strategies for
-Reliable ML Training on Kubernetes"* — covers memory requests/limits, QoS,
-eviction policy, and ephemeral-storage exhaustion specifically for ML
-training workloads on Kubernetes. Worth reading in full before citing —
-we have not yet independently verified whether it discusses orphaned
-multiprocessing workers specifically or ML training memory reliability
-more generally; confirm scope before quoting it as directly on-topic.
+**Checked and rejected as a citation**: the arXiv paper (Dec 2024, 2412.14701),
+*"Taming the Memory Beast: Strategies for Reliable ML Training on
+Kubernetes"* — read in full. It covers Kubernetes-level resource
+management only (requests/limits, QoS classes, pod eviction, ephemeral
+storage, OOM troubleshooting at the *scheduler/orchestration* level). It
+does not discuss orphaned processes, PID 1 reparenting, `/dev/shm`,
+multiprocessing workers, SIGKILL, or the OOM-killer's interaction with
+child processes anywhere in the text. Not on-topic for this project —
+do not cite it.
 
 ---
 
