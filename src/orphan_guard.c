@@ -14,7 +14,7 @@
 #define MAX_CANDIDATES 4096
 #define GRACE_WINDOW_SEC 2   /* time to wait after parent exit before first checking shm */
 #define KILL_GRACE_SEC   3   /* time to wait after SIGTERM before escalating to SIGKILL */
-#define MIN_CHILD_AGE_SEC 2  /* ignore a "parent exited" event for a child younger than this */
+#define MIN_PARENT_AGE_SEC 2  /* ignore an exit as handoff noise if the exiting process itself was younger than this */
 
 struct event {
     unsigned int type;
@@ -148,6 +148,20 @@ static int pod_is_exempt_via_annotation(const char *ns, const char *pod) {
     return (val != NULL && (val - key) < 40);
 }
 
+/* Looks up when `pid` was itself born (its own fork event), by pid. Used to
+ * tell a real orphan's dying parent from a launch-handoff shim's -- see
+ * handle_event(). Returns 0 if we never saw this pid forked (it predates
+ * our attach), in which case the caller should NOT treat it as handoff. */
+static int find_own_fork_time(int pid, time_t *out_seen_at) {
+    for (int i = 0; i < n_children; i++) {
+        if (children[i].pid == pid) {
+            *out_seen_at = children[i].seen_at;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void track_child(int pid, int ppid, unsigned long long start_time) {
     /* ponytail: circular overwrite once MAX_TRACKED is reached instead of a
      * proper LRU/hash map. Fine for a single scoped pod; swap for a hash
@@ -266,24 +280,33 @@ static int handle_event(void *ctx, void *data, size_t len) {
         track_child((int)e->pid, (int)e->ppid, get_start_time((int)e->pid));
     } else if (e->type == 2) {
         time_t now = time(NULL);
+
+        /* Guard against a false positive we hit in practice: container
+         * runtimes (confirmed with `kubectl exec` / runc) commonly
+         * double-fork internally and have an intermediate process exit
+         * right after the real target starts, as normal, healthy process
+         * handoff -- not a crash. The discriminating signal is how long
+         * the EXITING PROCESS ITSELF had been alive, not how young its
+         * children are: a handoff shim dies moments after its own birth,
+         * while a real parent (e.g. a Jupyter kernel) can live several
+         * seconds and still have forked a worker only moments before it
+         * dies -- that worker is a genuine orphan despite being young.
+         * (Originally this checked the child's age instead; that missed
+         * exactly this case -- see docs/troubleshooting.) A pid we never
+         * saw forked predates our attach, so it can't be a shim we just
+         * watched get born -- don't treat it as handoff. */
+        time_t parent_seen_at;
+        int has_parent_record = find_own_fork_time((int)e->pid, &parent_seen_at);
+        int is_handoff = has_parent_record && (now - parent_seen_at < MIN_PARENT_AGE_SEC);
+
         for (int i = 0; i < n_children; i++) {
             if (children[i].ppid != (int)e->pid) continue;
 
-            /* Guard against a false positive we hit in practice: container
-             * runtimes (confirmed with `kubectl exec` / runc) commonly
-             * double-fork internally and have the intermediate process
-             * exit right after the real target starts, as normal, healthy
-             * process handoff -- not a crash. A child born a moment ago
-             * whose "parent" immediately exits is far more likely to be
-             * that handoff than a real orphan. A real leak in every
-             * workload we tested (zombie_maker.py, PyTorch DataLoader,
-             * Ray) involved a worker that had been running for seconds
-             * before the parent died, not microseconds. */
-            if (now - children[i].seen_at < MIN_CHILD_AGE_SEC) {
-                char detail[96];
+            if (is_handoff) {
+                char detail[128];
                 snprintf(detail, sizeof(detail),
-                         "only %lds old, likely process-launch handoff noise, not a real orphan",
-                         (long)(now - children[i].seen_at));
+                         "exiting parent pid %d only lived %lds, likely process-launch handoff noise, not a real orphan",
+                         (int)e->pid, (long)(now - parent_seen_at));
                 audit_log("INFO", children[i].pid, "SKIP_HANDOFF", detail);
                 continue;
             }
